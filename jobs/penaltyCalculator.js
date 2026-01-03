@@ -110,6 +110,9 @@ export async function calculateWeeklyPenalties(referenceDate = null) {
       } (Sunday) to ${currentWeekEnd.toISOString().split("T")[0]} (Saturday)`
     );
 
+    // Track unique user IDs to charge pending penalties after calculation
+    const processedUserIds = new Set();
+
     // Process goals sequentially to prevent race conditions on balance updates
     // This ensures each penalty deduction sees the updated balance from previous deductions
     for (const goal of activeGoals) {
@@ -264,9 +267,28 @@ export async function calculateWeeklyPenalties(referenceDate = null) {
             `Goal ${goal.id}: ${completedDays}/${requiredDays} days completed. No penalty - goal met!`
           );
         }
+
+        // Track user ID for pending penalty charging
+        processedUserIds.add(goal.user_id);
       } catch (error) {
         console.error(`Error processing goal ${goal.id}:`, error);
         continue;
+      }
+    }
+
+    // After calculating all penalties, attempt to charge pending penalties for users with payment methods
+    console.log(
+      "\n💳 Attempting to charge pending penalties for users with payment methods..."
+    );
+    for (const userId of processedUserIds) {
+      try {
+        await chargePendingPenalties(userId);
+      } catch (error) {
+        console.error(
+          `Error charging pending penalties for user ${userId}:`,
+          error
+        );
+        // Continue with other users even if one fails
       }
     }
 
@@ -492,6 +514,504 @@ async function deductPenalty(userId, amount, goalId, penaltyRecordId) {
     }
   } catch (error) {
     console.error(`Error deducting penalty for user ${userId}:`, error);
+  }
+}
+
+/**
+ * Charge pending penalties for a user when payment method is available
+ * This is called after a payment method is set as default or during penalty calculation
+ */
+export async function chargePendingPenalties(userId) {
+  try {
+    // Get user with payment method info
+    const { data: user, error: userError } = await supabase
+      .from("users")
+      .select("stripe_customer_id, default_payment_method_id, currency")
+      .eq("id", userId)
+      .single();
+
+    if (userError || !user) {
+      console.error(`User not found for charging pending penalties: ${userId}`);
+      return;
+    }
+
+    if (!user.stripe_customer_id || !user.default_payment_method_id) {
+      console.log(`User ${userId} doesn't have payment method set up yet`);
+      return;
+    }
+
+    // Get balance to check pending penalties and available balance
+    const { data: balance } = await supabase
+      .from("commitment_balances")
+      .select("pending_penalties, available_balance")
+      .eq("user_id", userId)
+      .single();
+
+    if (!balance || parseFloat(balance.pending_penalties) <= 0) {
+      console.log(`No pending penalties for user ${userId}`);
+      return;
+    }
+
+    const pendingAmount = parseFloat(balance.pending_penalties);
+    const availableBalance = parseFloat(balance.available_balance) || 0;
+
+    console.log(
+      `💳 Attempting to charge $${pendingAmount.toFixed(
+        2
+      )} in pending penalties for user ${userId}`
+    );
+    console.log(`   💰 Available balance: $${availableBalance.toFixed(2)}`);
+
+    // Get all goals for the user first
+    const { data: userGoals, error: goalsError } = await supabase
+      .from("goals")
+      .select("id")
+      .eq("user_id", userId);
+
+    if (goalsError || !userGoals || userGoals.length === 0) {
+      console.log(`   ⚠️  No goals found for user ${userId}`);
+      return;
+    }
+
+    const goalIds = userGoals.map((g) => g.id);
+    console.log(`   📋 Found ${goalIds.length} goal(s) for user ${userId}`);
+
+    // Get unpaid penalty records for user's goals
+    const { data: unpaidPenalties, error: penaltiesError } = await supabase
+      .from("penalty_records")
+      .select("*")
+      .in("goal_id", goalIds)
+      .eq("paid", false)
+      .order("week_start_date", { ascending: true });
+
+    if (penaltiesError) {
+      console.error(
+        `   ❌ Error fetching unpaid penalties for user ${userId}:`,
+        penaltiesError.message
+      );
+      return;
+    }
+
+    const currency = user.currency || "usd";
+    let successCount = 0;
+    let failCount = 0;
+
+    if (!unpaidPenalties || unpaidPenalties.length === 0) {
+      // No unpaid penalty records, but balance shows pending penalties
+      // This can happen if penalties were marked as paid but balance wasn't updated
+      // Charge the pending amount directly
+      console.log(
+        `   ⚠️  No unpaid penalty records found, but balance shows $${pendingAmount.toFixed(
+          2
+        )} pending. Charging pending amount directly.`
+      );
+
+      if (pendingAmount > 0) {
+        // First, deduct from available balance
+        const amountToDeductFromBalance = Math.min(
+          availableBalance,
+          pendingAmount
+        );
+        const amountToCharge = pendingAmount - amountToDeductFromBalance;
+
+        try {
+          console.log(
+            `   💳 Processing: Deducting $${amountToDeductFromBalance.toFixed(
+              2
+            )} from balance, charging $${amountToCharge.toFixed(2)} to card`
+          );
+
+          // Deduct from available balance first
+          if (amountToDeductFromBalance > 0) {
+            const newAvailableBalance =
+              availableBalance - amountToDeductFromBalance;
+            const newPendingPenalties =
+              pendingAmount - amountToDeductFromBalance;
+
+            const { error: balanceUpdateError } = await supabase
+              .from("commitment_balances")
+              .update({
+                available_balance: newAvailableBalance,
+                pending_penalties: newPendingPenalties,
+              })
+              .eq("user_id", userId);
+
+            if (balanceUpdateError) {
+              console.error(
+                `   ❌ Failed to deduct from balance for user ${userId}:`,
+                balanceUpdateError.message
+              );
+            } else {
+              console.log(
+                `   💰 Balance deducted: available $${availableBalance.toFixed(
+                  2
+                )} → $${newAvailableBalance.toFixed(
+                  2
+                )}, pending $${pendingAmount.toFixed(
+                  2
+                )} → $${newPendingPenalties.toFixed(2)}`
+              );
+            }
+          }
+
+          // Charge remaining amount to card if needed
+          if (amountToCharge > 0) {
+            console.log(
+              `   💳 Charging remaining amount to card: $${amountToCharge.toFixed(
+                2
+              )}`
+            );
+            const paymentIntent = await stripe.paymentIntents.create({
+              amount: Math.round(amountToCharge * 100),
+              currency: currency,
+              customer: user.stripe_customer_id,
+              payment_method: user.default_payment_method_id,
+              off_session: true,
+              confirm: true,
+              metadata: {
+                user_id: userId,
+                type: "penalty",
+                source: "pending_balance_charge",
+              },
+            });
+
+            console.log(
+              `   📝 Payment intent created: ${paymentIntent.id}, status: ${paymentIntent.status}`
+            );
+
+            if (paymentIntent.status === "succeeded") {
+              successCount++;
+              // Record transaction
+              await supabase.from("payment_transactions").insert({
+                user_id: userId,
+                stripe_payment_intent_id: paymentIntent.id,
+                stripe_customer_id: user.stripe_customer_id,
+                amount: amountToCharge,
+                currency: currency,
+                status: "succeeded",
+                type: "penalty",
+                metadata: {
+                  source: "pending_balance_charge",
+                },
+              });
+
+              // Clear remaining pending penalties
+              const { error: balanceUpdateError } = await supabase
+                .from("commitment_balances")
+                .update({
+                  pending_penalties: 0,
+                })
+                .eq("user_id", userId);
+
+              if (balanceUpdateError) {
+                console.error(
+                  `   ❌ Failed to update balance for user ${userId}:`,
+                  balanceUpdateError.message
+                );
+              } else {
+                console.log(
+                  `   💰 Balance updated: pending_penalties cleared to $0.00`
+                );
+              }
+
+              console.log(
+                `   ✅ Successfully charged $${amountToCharge.toFixed(
+                  2
+                )} to card (user ${userId})`
+              );
+            } else {
+              failCount++;
+              console.log(
+                `   ⚠️  Payment intent has status: ${paymentIntent.status}`
+              );
+              // Revert the balance deduction if charge failed
+              if (amountToDeductFromBalance > 0) {
+                const { error: revertError } = await supabase
+                  .from("commitment_balances")
+                  .update({
+                    available_balance: availableBalance,
+                    pending_penalties: pendingAmount,
+                  })
+                  .eq("user_id", userId);
+                if (revertError) {
+                  console.error(
+                    `   ❌ Failed to revert balance:`,
+                    revertError.message
+                  );
+                }
+              }
+            }
+          } else {
+            // All pending penalties were covered by available balance
+            successCount++;
+            console.log(
+              `   ✅ All pending penalties covered by available balance (user ${userId})`
+            );
+          }
+        } catch (stripeError) {
+          failCount++;
+          console.error(
+            `   ❌ Failed to charge pending balance for user ${userId}:`,
+            stripeError.message
+          );
+          if (stripeError.code) {
+            console.error(`   Error code: ${stripeError.code}`);
+          }
+          // Revert the balance deduction if charge failed
+          if (amountToDeductFromBalance > 0) {
+            const { error: revertError } = await supabase
+              .from("commitment_balances")
+              .update({
+                available_balance: availableBalance,
+                pending_penalties: pendingAmount,
+              })
+              .eq("user_id", userId);
+            if (revertError) {
+              console.error(
+                `   ❌ Failed to revert balance:`,
+                revertError.message
+              );
+            }
+          }
+        }
+      }
+
+      console.log(
+        `   📊 Charging complete for user ${userId}: ${successCount} succeeded, ${failCount} failed`
+      );
+      return;
+    }
+
+    console.log(
+      `   📊 Found ${
+        unpaidPenalties.length
+      } unpaid penalty record(s) totaling $${unpaidPenalties
+        .reduce((sum, p) => sum + parseFloat(p.penalty_amount), 0)
+        .toFixed(2)}`
+    );
+
+    // Charge each unpaid penalty
+    // Track available balance as we process penalties
+    let currentAvailableBalance = availableBalance;
+
+    for (const penalty of unpaidPenalties) {
+      try {
+        const penaltyAmount = parseFloat(penalty.penalty_amount);
+
+        // First, deduct from available balance
+        const amountToDeductFromBalance = Math.min(
+          currentAvailableBalance,
+          penaltyAmount
+        );
+        const amountToCharge = penaltyAmount - amountToDeductFromBalance;
+
+        console.log(
+          `   💳 Processing penalty ${penalty.id}: $${penaltyAmount.toFixed(
+            2
+          )} (Deducting $${amountToDeductFromBalance.toFixed(
+            2
+          )} from balance, charging $${amountToCharge.toFixed(2)} to card)`
+        );
+
+        // Deduct from available balance first
+        if (amountToDeductFromBalance > 0) {
+          currentAvailableBalance -= amountToDeductFromBalance;
+
+          const { data: currentBalance } = await supabase
+            .from("commitment_balances")
+            .select("pending_penalties, available_balance")
+            .eq("user_id", userId)
+            .single();
+
+          if (currentBalance) {
+            const newPendingPenalties = Math.max(
+              0,
+              parseFloat(currentBalance.pending_penalties) -
+                amountToDeductFromBalance
+            );
+
+            const { error: balanceUpdateError } = await supabase
+              .from("commitment_balances")
+              .update({
+                available_balance: currentAvailableBalance,
+                pending_penalties: newPendingPenalties,
+              })
+              .eq("user_id", userId);
+
+            if (balanceUpdateError) {
+              console.error(
+                `   ❌ Failed to deduct from balance for user ${userId}:`,
+                balanceUpdateError.message
+              );
+            } else {
+              console.log(
+                `   💰 Balance deducted: available → $${currentAvailableBalance.toFixed(
+                  2
+                )}, pending reduced by $${amountToDeductFromBalance.toFixed(2)}`
+              );
+            }
+          }
+        }
+
+        // Charge remaining amount to card if needed
+        if (amountToCharge > 0) {
+          const paymentIntent = await stripe.paymentIntents.create({
+            amount: Math.round(amountToCharge * 100),
+            currency: currency,
+            customer: user.stripe_customer_id,
+            payment_method: user.default_payment_method_id,
+            off_session: true,
+            confirm: true,
+            metadata: {
+              user_id: userId,
+              type: "penalty",
+              goal_id: penalty.goal_id,
+              penalty_record_id: penalty.id,
+            },
+          });
+
+          console.log(
+            `   📝 Payment intent created: ${paymentIntent.id}, status: ${paymentIntent.status}`
+          );
+
+          if (paymentIntent.status === "succeeded") {
+            successCount++;
+            // Mark penalty as paid
+            await supabase
+              .from("penalty_records")
+              .update({ paid: true })
+              .eq("id", penalty.id);
+
+            // Record transaction
+            await supabase.from("payment_transactions").insert({
+              user_id: userId,
+              stripe_payment_intent_id: paymentIntent.id,
+              stripe_customer_id: user.stripe_customer_id,
+              amount: amountToCharge,
+              currency: currency,
+              status: "succeeded",
+              type: "penalty",
+              goal_id: penalty.goal_id,
+              metadata: {
+                penalty_record_id: penalty.id,
+                source: "stripe_charge",
+              },
+            });
+
+            // Update balance - reduce remaining pending penalties
+            const { data: currentBalance } = await supabase
+              .from("commitment_balances")
+              .select("pending_penalties")
+              .eq("user_id", userId)
+              .single();
+
+            if (currentBalance) {
+              const oldPending = parseFloat(currentBalance.pending_penalties);
+              const newPendingPenalties = Math.max(
+                0,
+                oldPending - amountToCharge
+              );
+
+              const { error: balanceUpdateError } = await supabase
+                .from("commitment_balances")
+                .update({
+                  pending_penalties: newPendingPenalties,
+                })
+                .eq("user_id", userId);
+
+              if (balanceUpdateError) {
+                console.error(
+                  `   ❌ Failed to update balance for user ${userId}:`,
+                  balanceUpdateError.message
+                );
+              } else {
+                console.log(
+                  `   💰 Balance updated: pending_penalties $${oldPending.toFixed(
+                    2
+                  )} → $${newPendingPenalties.toFixed(2)}`
+                );
+              }
+            }
+
+            console.log(
+              `   ✅ Successfully charged $${amountToCharge.toFixed(
+                2
+              )} to card for penalty ${penalty.id} (user ${userId})`
+            );
+          } else {
+            failCount++;
+            console.log(
+              `   ⚠️  Payment intent for penalty ${penalty.id} has status: ${paymentIntent.status}`
+            );
+            // Revert balance deduction if charge failed
+            if (amountToDeductFromBalance > 0) {
+              currentAvailableBalance += amountToDeductFromBalance;
+              const { data: currentBalance } = await supabase
+                .from("commitment_balances")
+                .select("pending_penalties, available_balance")
+                .eq("user_id", userId)
+                .single();
+              if (currentBalance) {
+                await supabase
+                  .from("commitment_balances")
+                  .update({
+                    available_balance: currentAvailableBalance,
+                    pending_penalties:
+                      parseFloat(currentBalance.pending_penalties) +
+                      amountToDeductFromBalance,
+                  })
+                  .eq("user_id", userId);
+              }
+            }
+          }
+        } else {
+          // All penalty covered by available balance
+          successCount++;
+          // Mark penalty as paid
+          await supabase
+            .from("penalty_records")
+            .update({ paid: true })
+            .eq("id", penalty.id);
+
+          // Record transaction for balance deduction
+          await supabase.from("payment_transactions").insert({
+            user_id: userId,
+            amount: amountToDeductFromBalance,
+            currency: currency,
+            status: "succeeded",
+            type: "penalty",
+            goal_id: penalty.goal_id,
+            metadata: {
+              penalty_record_id: penalty.id,
+              source: "balance_deduction",
+            },
+          });
+
+          console.log(
+            `   ✅ Penalty ${penalty.id} fully covered by available balance (user ${userId})`
+          );
+        }
+      } catch (stripeError) {
+        failCount++;
+        console.error(
+          `   ❌ Failed to charge penalty ${penalty.id} for user ${userId}:`,
+          stripeError.message
+        );
+        if (stripeError.code) {
+          console.error(`   Error code: ${stripeError.code}`);
+        }
+        // Continue with next penalty even if one fails
+      }
+    }
+
+    console.log(
+      `   📊 Charging complete for user ${userId}: ${successCount} succeeded, ${failCount} failed`
+    );
+  } catch (error) {
+    console.error(
+      `Error charging pending penalties for user ${userId}:`,
+      error
+    );
   }
 }
 

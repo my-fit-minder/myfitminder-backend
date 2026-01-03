@@ -2,7 +2,10 @@ import express from "express";
 import { supabase } from "../config/database.js";
 import { stripe } from "../config/stripe.js";
 import { authenticateToken } from "../middleware/auth.js";
-import { getWeekStart } from "../jobs/penaltyCalculator.js";
+import {
+  getWeekStart,
+  chargePendingPenalties,
+} from "../jobs/penaltyCalculator.js";
 
 const router = express.Router();
 
@@ -81,6 +84,9 @@ router.post("/confirm-setup", authenticateToken, async (req, res) => {
     // Get payment method details
     const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
 
+    // Attempt to charge any pending penalties now that payment method is added
+    await chargePendingPenalties(req.user.id);
+
     res.json({
       success: true,
       paymentMethod: {
@@ -155,6 +161,9 @@ router.post(
         .update({ default_payment_method_id: paymentMethodId })
         .eq("id", req.user.id);
 
+      // Attempt to charge any pending penalties now that default payment method is set
+      await chargePendingPenalties(req.user.id);
+
       res.json({ success: true });
     } catch (error) {
       console.error("Set default payment method error:", error);
@@ -213,8 +222,8 @@ router.post("/charge-penalty", authenticateToken, async (req, res) => {
     }
 
     // Get user currency (default to 'usd' if not set)
-    const currency = req.user.currency || 'usd';
-    
+    const currency = req.user.currency || "usd";
+
     // Create PaymentIntent and confirm immediately with saved card
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(amount * 100), // Convert to cents
@@ -284,7 +293,7 @@ router.post("/deposit", authenticateToken, async (req, res) => {
     }
 
     const stripeCustomerId = await getOrCreateStripeCustomer(req.user);
-    const currency = req.user.currency || 'usd';
+    const currency = req.user.currency || "usd";
 
     // If user has a saved payment method, charge it directly
     if (req.user.default_payment_method_id) {
@@ -777,25 +786,30 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
     // Calculate fees
     // Stripe fee: 2.9% + $0.30
     const stripeFeeRate = 0.029; // 2.9%
-    const stripeFixedFee = 0.30; // $0.30
-    const stripeFee = (amount * stripeFeeRate) + stripeFixedFee;
-    
+    const stripeFixedFee = 0.3; // $0.30
+    const stripeFee = amount * stripeFeeRate + stripeFixedFee;
+
     // Currency conversion fee: 1% (charged by card issuer for non-USD cards)
     // Note: We assume all users may have non-USD cards, so we apply this fee
     // In practice, you might want to check the user's card currency
     const conversionFeeRate = 0.01; // 1%
     const conversionFee = amount * conversionFeeRate;
-    
+
     // Total fees
     const totalFees = stripeFee + conversionFee;
-    
+
     // Net amount after fees
     const netAmount = amount - totalFees;
-    
+
     // Ensure net amount is positive
     if (netAmount <= 0) {
       return res.status(400).json({
-        error: `Payout amount is too small. After fees (${((totalFees / amount) * 100).toFixed(2)}%), the net amount would be $${netAmount.toFixed(2)}. Minimum payout after fees must be at least $0.01.`,
+        error: `Payout amount is too small. After fees (${(
+          (totalFees / amount) *
+          100
+        ).toFixed(2)}%), the net amount would be $${netAmount.toFixed(
+          2
+        )}. Minimum payout after fees must be at least $0.01.`,
       });
     }
 
@@ -861,13 +875,15 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
         payoutStatus = "payout_failed";
       }
 
-      const currency = req.user.currency || 'usd';
+      const currency = req.user.currency || "usd";
       // Calculate fees for this specific payout
-      const payoutStripeFee = (payoutAmount * stripeFeeRate) + (stripeFixedFee * (payoutAmount / totalPaidOut));
+      const payoutStripeFee =
+        payoutAmount * stripeFeeRate +
+        stripeFixedFee * (payoutAmount / totalPaidOut);
       const payoutConversionFee = payoutAmount * conversionFeeRate;
       const payoutTotalFees = payoutStripeFee + payoutConversionFee;
       const payoutNetAmount = payoutAmount - payoutTotalFees;
-      
+
       const transactionData = {
         user_id: req.user.id,
         stripe_payment_intent_id: refund.id,
@@ -968,7 +984,7 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
     const allSucceeded = payouts.every((p) => p.refund.status === "succeeded");
 
     // Calculate fees for the actual payout amount
-    const actualStripeFee = (totalPaidOut * stripeFeeRate) + stripeFixedFee;
+    const actualStripeFee = totalPaidOut * stripeFeeRate + stripeFixedFee;
     const actualConversionFee = totalPaidOut * conversionFeeRate;
     const actualTotalFees = actualStripeFee + actualConversionFee;
     const actualNetAmount = totalPaidOut - actualTotalFees;
@@ -995,8 +1011,20 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
         },
         status: allSucceeded ? "succeeded" : "pending",
         message: allSucceeded
-          ? `Payout of $${totalPaidOut.toFixed(2)} processed successfully! After fees ($${actualTotalFees.toFixed(2)}), you will receive $${actualNetAmount.toFixed(2)}. Funds will be returned to the original payment methods used for deposits within 5-10 business days.`
-          : `Payout of $${totalPaidOut.toFixed(2)} is being processed. After fees ($${actualTotalFees.toFixed(2)}), you will receive $${actualNetAmount.toFixed(2)}. Funds will be returned to the original payment methods used for deposits.`,
+          ? `Payout of $${totalPaidOut.toFixed(
+              2
+            )} processed successfully! After fees ($${actualTotalFees.toFixed(
+              2
+            )}), you will receive $${actualNetAmount.toFixed(
+              2
+            )}. Funds will be returned to the original payment methods used for deposits within 5-10 business days.`
+          : `Payout of $${totalPaidOut.toFixed(
+              2
+            )} is being processed. After fees ($${actualTotalFees.toFixed(
+              2
+            )}), you will receive $${actualNetAmount.toFixed(
+              2
+            )}. Funds will be returned to the original payment methods used for deposits.`,
       },
     });
   } catch (error) {
@@ -1037,7 +1065,7 @@ router.post("/refund", authenticateToken, async (req, res) => {
     });
 
     // Record refund transaction
-    const currency = req.user.currency || 'usd';
+    const currency = req.user.currency || "usd";
     await supabase.from("payment_transactions").insert({
       user_id: req.user.id,
       stripe_payment_intent_id: refund.id,
