@@ -161,6 +161,15 @@ ALTER TABLE public.penalty_records ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Users can read own data" ON public.users
     FOR SELECT USING (auth.uid() = id);
 
+-- Allow backend (service role) to insert users during signup
+-- Service role should bypass RLS, but this policy ensures inserts work
+CREATE POLICY "Service role can insert users" ON public.users
+    FOR INSERT WITH CHECK (true);
+
+-- Users can insert their own record (for compatibility)
+CREATE POLICY "Users can insert own record" ON public.users
+    FOR INSERT WITH CHECK (auth.uid() = id);
+
 CREATE POLICY "Users can read own goals" ON public.goals
     FOR SELECT USING (auth.uid() = user_id);
 

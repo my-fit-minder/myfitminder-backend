@@ -80,13 +80,77 @@ router.post("/signin", async (req, res) => {
     }
 
     // Sign in with Supabase
-    const { data: authData, error: authError } =
+    let { data: authData, error: authError } =
       await supabase.auth.signInWithPassword({
         email,
         password,
       });
 
-    if (authError || !authData.user) {
+    // If email verification is required, auto-confirm the user and retry
+    if (
+      authError &&
+      (authError.message?.includes("email_not_confirmed") ||
+        authError.message?.includes("Email not confirmed") ||
+        authError.message?.includes("not confirmed"))
+    ) {
+      try {
+        // Get user by email using Admin API
+        const listResponse = await fetch(
+          `${
+            process.env.SUPABASE_URL
+          }/auth/v1/admin/users?email=${encodeURIComponent(email)}`,
+          {
+            method: "GET",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+              apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+            },
+          }
+        );
+
+        if (listResponse.ok) {
+          const usersData = await listResponse.json();
+          const unconfirmedUser = usersData.users?.find(
+            (u) => u.email === email
+          );
+
+          if (unconfirmedUser) {
+            // Auto-confirm the user using Admin API
+            const updateResponse = await fetch(
+              `${process.env.SUPABASE_URL}/auth/v1/admin/users/${unconfirmedUser.id}`,
+              {
+                method: "PUT",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+                  apikey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+                },
+                body: JSON.stringify({
+                  email_confirm: true,
+                }),
+              }
+            );
+
+            if (updateResponse.ok) {
+              // Retry sign in after confirmation
+              const retryResult = await supabase.auth.signInWithPassword({
+                email,
+                password,
+              });
+
+              authData = retryResult.data;
+              authError = retryResult.error;
+            }
+          }
+        }
+      } catch (adminError) {
+        console.error("Error auto-confirming user:", adminError);
+        // Continue with original error if admin API fails
+      }
+    }
+
+    if (authError || !authData?.user) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
