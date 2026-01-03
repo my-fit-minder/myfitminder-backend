@@ -862,6 +862,9 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
       });
     }
 
+    // Calculate total paid out amount (needed for fee calculations)
+    const totalPaidOut = payouts.reduce((sum, p) => sum + p.amount, 0);
+
     // Record all payout transactions
     for (const { refund, amount: payoutAmount } of payouts) {
       // Map Stripe refund status to payout status
@@ -877,6 +880,7 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
 
       const currency = req.user.currency || "usd";
       // Calculate fees for this specific payout
+      // Proportionally distribute the fixed fee across all payouts
       const payoutStripeFee =
         payoutAmount * stripeFeeRate +
         stripeFixedFee * (payoutAmount / totalPaidOut);
@@ -979,8 +983,7 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
       `Completed payout transaction recording. Processed ${payouts.length} payouts.`
     );
 
-    // Calculate total paid out amount
-    const totalPaidOut = payouts.reduce((sum, p) => sum + p.amount, 0);
+    // totalPaidOut is already calculated above
     const allSucceeded = payouts.every((p) => p.refund.status === "succeeded");
 
     // Calculate fees for the actual payout amount

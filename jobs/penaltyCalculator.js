@@ -126,6 +126,21 @@ export async function calculateWeeklyPenalties(referenceDate = null) {
           continue; // Week does not overlap with goal period
         }
 
+        // Skip penalty calculation if goal starts after Sunday (Mon-Sat) within this week
+        // If goal start date is within the current week and it's not Sunday, don't charge penalty
+        if (goalStart >= currentWeekStart && goalStart <= currentWeekEnd) {
+          const goalStartDay = goalStart.getUTCDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+          if (goalStartDay !== 0) {
+            // Goal starts on Monday-Saturday within this week, skip penalty for this week
+            console.log(
+              `Goal ${goal.id} starts on ${
+                goalStart.toISOString().split("T")[0]
+              } (day ${goalStartDay}) within this week. Skipping penalty calculation for this week.`
+            );
+            continue;
+          }
+        }
+
         // SYNC STEP: Check data freshness before calculating penalties
         console.log(`\n🔄 Checking data freshness for goal ${goal.id}...`);
         const dataFreshness = await checkDataFreshness(
