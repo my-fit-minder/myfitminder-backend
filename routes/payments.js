@@ -197,16 +197,44 @@ router.post("/confirm-setup", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "SetupIntent not succeeded" });
     }
 
+    // Get or create Stripe customer
+    const stripeCustomerId = await getOrCreateStripeCustomer(req.user);
+
     // Set as default payment method
     const paymentMethodId = setupIntent.payment_method;
 
+    // Get payment method details
+    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
+
+    // Explicitly attach payment method to customer if not already attached
+    // This ensures the payment method appears in the customer's payment methods list
+    if (
+      !paymentMethod.customer ||
+      paymentMethod.customer !== stripeCustomerId
+    ) {
+      try {
+        await stripe.paymentMethods.attach(paymentMethodId, {
+          customer: stripeCustomerId,
+        });
+        console.log(
+          `Attached payment method ${paymentMethodId} to customer ${stripeCustomerId}`
+        );
+      } catch (attachError) {
+        // If already attached, that's fine - continue
+        if (attachError.code !== "resource_already_exists") {
+          throw attachError;
+        }
+        console.log(
+          `Payment method ${paymentMethodId} already attached to customer`
+        );
+      }
+    }
+
+    // Update user with default payment method
     await supabase
       .from("users")
       .update({ default_payment_method_id: paymentMethodId })
       .eq("id", req.user.id);
-
-    // Get payment method details
-    const paymentMethod = await stripe.paymentMethods.retrieve(paymentMethodId);
 
     // Attempt to charge any pending penalties now that payment method is added
     await chargePendingPenalties(req.user.id);
