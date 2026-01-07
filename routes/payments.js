@@ -1005,14 +1005,46 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
     // Note: Stripe refunds can only go back to the original payment method used for each deposit
     // Funds will be returned to the cards that were originally charged
     // Use the intents we already determined will be used
+    // IMPORTANT: Refund the NET amount after fees, not the full amount
     const payouts = [];
 
     for (const intent of intentsToUse) {
       try {
-        // Use Stripe's refund API to process the payout
+        // Find the fee breakdown for this intent to calculate net amount
+        const intentFeeBreakdown = feeBreakdowns.find(
+          (fb) => fb.paymentIntentId === intent.paymentIntentId
+        );
+
+        let netPayoutAmount = intent.payoutAmount;
+
+        if (intentFeeBreakdown) {
+          // Calculate net amount after fees for this specific intent
+          netPayoutAmount =
+            intent.payoutAmount - intentFeeBreakdown.fees.totalFees;
+        } else {
+          // Fallback: calculate fees for this intent
+          const fees = await calculateStripeFees(
+            intent.paymentIntentId,
+            intent.payoutAmount,
+            userCurrency
+          );
+          netPayoutAmount = intent.payoutAmount - fees.totalFees;
+        }
+
+        // Ensure net amount is positive
+        if (netPayoutAmount <= 0) {
+          console.warn(
+            `Skipping payout for ${
+              intent.paymentIntentId
+            }: net amount after fees is $${netPayoutAmount.toFixed(2)}`
+          );
+          continue;
+        }
+
+        // Use Stripe's refund API to process the payout (refund NET amount after fees)
         const refund = await stripe.refunds.create({
           payment_intent: intent.paymentIntentId,
-          amount: Math.round(intent.payoutAmount * 100), // Convert to cents
+          amount: Math.round(netPayoutAmount * 100), // Convert to cents - refund NET amount
           metadata: {
             user_id: req.user.id,
             type: "wallet_payout",
@@ -1021,7 +1053,8 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
 
         payouts.push({
           refund,
-          amount: intent.payoutAmount,
+          amount: netPayoutAmount, // Store net amount
+          grossAmount: intent.payoutAmount, // Store original amount for reference
         });
       } catch (error) {
         console.error(
@@ -1039,11 +1072,17 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
       });
     }
 
-    // Calculate total paid out amount (needed for fee calculations)
-    const totalPaidOut = payouts.reduce((sum, p) => sum + p.amount, 0);
+    // Calculate total paid out amounts
+    // payouts.amount is the NET amount (after fees) that was refunded
+    // We also need the gross amount for fee calculations
+    const totalPaidOut = payouts.reduce((sum, p) => sum + p.amount, 0); // Net amount refunded
+    const totalGrossAmount = payouts.reduce(
+      (sum, p) => sum + (p.grossAmount || p.amount),
+      0
+    ); // Gross amount before fees
 
     // Record all payout transactions
-    for (const { refund, amount: payoutAmount } of payouts) {
+    for (const { refund, amount: payoutAmount, grossAmount } of payouts) {
       // Map Stripe refund status to payout status
       // Try payout-specific statuses first, fallback to generic if constraint not updated
       let payoutStatus;
@@ -1059,27 +1098,30 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
 
       // Calculate fees for this specific payout based on the original payment intent
       // Find the fee breakdown for this payment intent
+      // Note: payoutAmount is already the NET amount (after fees were deducted)
       const intentFeeBreakdown = feeBreakdowns.find(
         (fb) => fb.paymentIntentId === refund.payment_intent
       );
 
       let payoutTotalFees;
-      let payoutNetAmount;
+      let payoutNetAmount = payoutAmount; // Already net amount
+      let grossPayoutAmount = grossAmount || payoutAmount; // Original gross amount
 
       if (intentFeeBreakdown) {
-        // Use calculated fees, proportionally adjusted for this payout amount
-        const feeProportion = payoutAmount / intentFeeBreakdown.amount;
-        payoutTotalFees = intentFeeBreakdown.fees.totalFees * feeProportion;
-        payoutNetAmount = payoutAmount - payoutTotalFees;
+        // Calculate fees based on the gross amount
+        payoutTotalFees = intentFeeBreakdown.fees.totalFees;
+        grossPayoutAmount = intentFeeBreakdown.amount; // Original gross amount
+        payoutNetAmount = payoutAmount; // Already net (gross - fees)
       } else {
         // Fallback: calculate fees for this specific payment intent
+        // Use grossAmount if available, otherwise use payoutAmount
         const fees = await calculateStripeFees(
           refund.payment_intent,
-          payoutAmount,
+          grossPayoutAmount,
           currency
         );
         payoutTotalFees = fees.totalFees;
-        payoutNetAmount = payoutAmount - payoutTotalFees;
+        payoutNetAmount = grossPayoutAmount - fees.totalFees;
       }
 
       const transactionData = {
@@ -1180,41 +1222,49 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
 
     // Calculate actual fees for the total payout
     // Sum up all the fees from individual payouts
+    // Note: payouts now contain net amounts, so we need to calculate fees from gross amounts
     let actualTotalFees = 0;
-    for (const { refund, amount: payoutAmount } of payouts) {
+
+    for (const { refund, amount: netPayoutAmount, grossAmount } of payouts) {
       const intentFeeBreakdown = feeBreakdowns.find(
         (fb) => fb.paymentIntentId === refund.payment_intent
       );
 
       if (intentFeeBreakdown) {
-        const feeProportion = payoutAmount / intentFeeBreakdown.amount;
-        actualTotalFees += intentFeeBreakdown.fees.totalFees * feeProportion;
+        // Fees were already calculated for the gross amount
+        actualTotalFees += intentFeeBreakdown.fees.totalFees;
       } else {
         // Fallback: recalculate for this payment intent
+        // Use grossAmount if available, otherwise estimate from net amount
+        const grossAmountToUse = grossAmount || netPayoutAmount;
         const fees = await calculateStripeFees(
           refund.payment_intent,
-          payoutAmount,
+          grossAmountToUse,
           userCurrency
         );
         actualTotalFees += fees.totalFees;
       }
     }
 
-    // If we still don't have fees calculated, use conservative estimate
+    // If we still don't have fees calculated, use conservative estimate based on gross amount
     if (actualTotalFees === 0) {
       const conservativeFeeRate = 0.029 + 0.008 + 0.02; // 2.9% + 0.8% + 2%
       const conservativeFixedFee = 0.3;
       actualTotalFees =
-        totalPaidOut * conservativeFeeRate + conservativeFixedFee;
+        totalGrossAmount * conservativeFeeRate + conservativeFixedFee;
     }
 
-    const actualNetAmount = totalPaidOut - actualTotalFees;
+    // actualNetAmount is the total amount refunded (which is already net after fees)
+    const actualNetAmount = totalPaidOut;
 
-    // Update balance immediately (deduct full amount including fees from available balance and add net payout to total payout)
+    // Update balance immediately
+    // Deduct the GROSS amount (original requested amount) from available balance
+    // This includes the fees that were deducted
+    // Add the NET amount (actual refunded amount) to total_payout
     await supabase
       .from("commitment_balances")
       .update({
-        available_balance: Math.max(0, availableBalance - totalPaidOut), // Deduct full amount (fees included)
+        available_balance: Math.max(0, availableBalance - amount), // Deduct full requested amount (fees included)
         total_payout: (parseFloat(balance.total_payout) || 0) + actualNetAmount, // Add net amount after fees
       })
       .eq("user_id", req.user.id);
