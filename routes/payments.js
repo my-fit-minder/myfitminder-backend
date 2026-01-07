@@ -1,6 +1,6 @@
 import express from "express";
 import { supabase } from "../config/database.js";
-import { stripe } from "../config/stripe.js";
+import { stripe, publishableKey } from "../config/stripe.js";
 import { authenticateToken } from "../middleware/auth.js";
 import {
   getWeekStart,
@@ -8,6 +8,130 @@ import {
 } from "../jobs/penaltyCalculator.js";
 
 const router = express.Router();
+
+// Get Stripe publishable key (public endpoint - no auth required)
+// This allows the iOS app to fetch the correct key based on backend environment
+// No App Store resubmission needed when switching from test to live!
+router.get("/publishable-key", (req, res) => {
+  if (!publishableKey) {
+    return res.status(500).json({
+      error: "Stripe publishable key not configured",
+    });
+  }
+
+  res.json({
+    publishableKey: publishableKey,
+    mode: publishableKey.startsWith("pk_live_") ? "live" : "test",
+  });
+});
+
+// Helper function to calculate Stripe fees based on payment intent details
+// Fees structure:
+// - Base: 2.9% + CA$0.30 for domestic cards
+// - +0.5% for manually entered cards
+// - +0.8% for international cards
+// - +2% if currency conversion is required
+async function calculateStripeFees(paymentIntentId, amount, userCurrency) {
+  try {
+    // Retrieve payment intent to get payment method and currency
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    // Base fee: 2.9% + CA$0.30
+    const baseFeeRate = 0.029; // 2.9%
+    const baseFixedFee = 0.3; // CA$0.30
+
+    let additionalFeeRate = 0;
+    let feeDetails = {
+      base: baseFeeRate,
+      fixed: baseFixedFee,
+      manuallyEntered: false,
+      international: false,
+      currencyConversion: false,
+    };
+
+    // Check if payment method exists
+    if (paymentIntent.payment_method) {
+      const paymentMethod = await stripe.paymentMethods.retrieve(
+        paymentIntent.payment_method
+      );
+
+      // Check if card is international (card country != account country)
+      // Get account country from environment variable or default to Canada
+      // Set STRIPE_ACCOUNT_COUNTRY in your .env file (e.g., "ca", "us")
+      const cardCountry = paymentMethod.card?.country?.toLowerCase();
+      const accountCountry = (
+        process.env.STRIPE_ACCOUNT_COUNTRY || "ca"
+      ).toLowerCase();
+
+      if (cardCountry && cardCountry !== accountCountry) {
+        additionalFeeRate += 0.008; // +0.8% for international cards
+        feeDetails.international = true;
+      }
+
+      // Check if card was manually entered
+      // This is determined by whether the payment method was created at payment time
+      // vs being a saved payment method. We can check if it was created recently
+      // (within a few seconds of the payment intent creation)
+      const paymentMethodCreated = new Date(paymentMethod.created * 1000);
+      const paymentIntentCreated = new Date(paymentIntent.created * 1000);
+      const timeDiff =
+        Math.abs(paymentMethodCreated - paymentIntentCreated) / 1000; // seconds
+
+      // If payment method was created within 5 seconds of payment intent, likely manually entered
+      if (timeDiff < 5) {
+        additionalFeeRate += 0.005; // +0.5% for manually entered cards
+        feeDetails.manuallyEntered = true;
+      }
+    }
+
+    // Check if currency conversion is required
+    const paymentCurrency = paymentIntent.currency?.toLowerCase();
+    const userCurrencyLower = (userCurrency || "usd").toLowerCase();
+
+    if (paymentCurrency && paymentCurrency !== userCurrencyLower) {
+      additionalFeeRate += 0.02; // +2% for currency conversion
+      feeDetails.currencyConversion = true;
+    }
+
+    // Calculate total fees
+    const totalFeeRate = baseFeeRate + additionalFeeRate;
+    const totalFees = amount * totalFeeRate + baseFixedFee;
+
+    return {
+      totalFees,
+      feeRate: totalFeeRate,
+      fixedFee: baseFixedFee,
+      details: feeDetails,
+      breakdown: {
+        baseFee: amount * baseFeeRate,
+        additionalFee: amount * additionalFeeRate,
+        fixedFee: baseFixedFee,
+      },
+    };
+  } catch (error) {
+    console.error("Error calculating Stripe fees:", error);
+    // Fallback to base fee if calculation fails
+    const baseFeeRate = 0.029;
+    const baseFixedFee = 0.3;
+    return {
+      totalFees: amount * baseFeeRate + baseFixedFee,
+      feeRate: baseFeeRate,
+      fixedFee: baseFixedFee,
+      details: {
+        base: baseFeeRate,
+        fixed: baseFixedFee,
+        manuallyEntered: false,
+        international: false,
+        currencyConversion: false,
+      },
+      breakdown: {
+        baseFee: amount * baseFeeRate,
+        additionalFee: 0,
+        fixedFee: baseFixedFee,
+      },
+    };
+  }
+}
 
 // Helper function to get or create Stripe customer
 async function getOrCreateStripeCustomer(user) {
@@ -783,20 +907,56 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
       });
     }
 
-    // Calculate fees
-    // Stripe fee: 2.9% + $0.30
-    const stripeFeeRate = 0.029; // 2.9%
-    const stripeFixedFee = 0.3; // $0.30
-    const stripeFee = amount * stripeFeeRate + stripeFixedFee;
+    // Determine which payment intents will be used for this payout
+    // We'll process them in order and calculate fees as we go
+    const userCurrency = req.user.currency || "usd";
+    let remainingAmount = amount;
+    const intentsToUse = [];
 
-    // Currency conversion fee: 1% (charged by card issuer for non-USD cards)
-    // Note: We assume all users may have non-USD cards, so we apply this fee
-    // In practice, you might want to check the user's card currency
-    const conversionFeeRate = 0.01; // 1%
-    const conversionFee = amount * conversionFeeRate;
+    for (const intent of payoutableIntents) {
+      if (remainingAmount <= 0) break;
 
-    // Total fees
-    const totalFees = stripeFee + conversionFee;
+      const payoutFromThisIntent = Math.min(
+        remainingAmount,
+        intent.payoutableAmount
+      );
+
+      intentsToUse.push({
+        ...intent,
+        payoutAmount: payoutFromThisIntent,
+      });
+
+      remainingAmount -= payoutFromThisIntent;
+    }
+
+    // Calculate fees for each payment intent that will be used
+    let totalFees = 0;
+    const feeBreakdowns = [];
+
+    for (const intent of intentsToUse) {
+      const fees = await calculateStripeFees(
+        intent.paymentIntentId,
+        intent.payoutAmount,
+        userCurrency
+      );
+      totalFees += fees.totalFees;
+      feeBreakdowns.push({
+        paymentIntentId: intent.paymentIntentId,
+        amount: intent.payoutAmount,
+        fees: fees,
+      });
+    }
+
+    // If we couldn't calculate fees for any intent, use conservative estimate
+    // Base: 2.9% + CA$0.30, assume worst case: +0.8% international + 2% conversion
+    if (totalFees === 0 || feeBreakdowns.length === 0) {
+      const conservativeFeeRate = 0.029 + 0.008 + 0.02; // 2.9% + 0.8% + 2%
+      const conservativeFixedFee = 0.3;
+      totalFees = amount * conservativeFeeRate + conservativeFixedFee;
+      console.warn(
+        "Using conservative fee estimate - could not calculate fees from payment intents"
+      );
+    }
 
     // Net amount after fees
     const netAmount = amount - totalFees;
@@ -816,24 +976,15 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
     // Process payout via Stripe refunds (sends money back to original payment methods)
     // Note: Stripe refunds can only go back to the original payment method used for each deposit
     // Funds will be returned to the cards that were originally charged
-    // Start with the most recent deposits
-    // We process the full requested amount, but fees are deducted from the user's balance
-    let remainingAmount = amount;
+    // Use the intents we already determined will be used
     const payouts = [];
 
-    for (const intent of payoutableIntents) {
-      if (remainingAmount <= 0) break;
-
-      const payoutFromThisIntent = Math.min(
-        remainingAmount,
-        intent.payoutableAmount
-      );
-
+    for (const intent of intentsToUse) {
       try {
         // Use Stripe's refund API to process the payout
         const refund = await stripe.refunds.create({
           payment_intent: intent.paymentIntentId,
-          amount: Math.round(payoutFromThisIntent * 100), // Convert to cents
+          amount: Math.round(intent.payoutAmount * 100), // Convert to cents
           metadata: {
             user_id: req.user.id,
             type: "wallet_payout",
@@ -842,10 +993,8 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
 
         payouts.push({
           refund,
-          amount: payoutFromThisIntent,
+          amount: intent.payoutAmount,
         });
-
-        remainingAmount -= payoutFromThisIntent;
       } catch (error) {
         console.error(
           `Error processing payout for ${intent.paymentIntentId}:`,
@@ -879,14 +1028,31 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
       }
 
       const currency = req.user.currency || "usd";
-      // Calculate fees for this specific payout
-      // Proportionally distribute the fixed fee across all payouts
-      const payoutStripeFee =
-        payoutAmount * stripeFeeRate +
-        stripeFixedFee * (payoutAmount / totalPaidOut);
-      const payoutConversionFee = payoutAmount * conversionFeeRate;
-      const payoutTotalFees = payoutStripeFee + payoutConversionFee;
-      const payoutNetAmount = payoutAmount - payoutTotalFees;
+
+      // Calculate fees for this specific payout based on the original payment intent
+      // Find the fee breakdown for this payment intent
+      const intentFeeBreakdown = feeBreakdowns.find(
+        (fb) => fb.paymentIntentId === refund.payment_intent
+      );
+
+      let payoutTotalFees;
+      let payoutNetAmount;
+
+      if (intentFeeBreakdown) {
+        // Use calculated fees, proportionally adjusted for this payout amount
+        const feeProportion = payoutAmount / intentFeeBreakdown.amount;
+        payoutTotalFees = intentFeeBreakdown.fees.totalFees * feeProportion;
+        payoutNetAmount = payoutAmount - payoutTotalFees;
+      } else {
+        // Fallback: calculate fees for this specific payment intent
+        const fees = await calculateStripeFees(
+          refund.payment_intent,
+          payoutAmount,
+          currency
+        );
+        payoutTotalFees = fees.totalFees;
+        payoutNetAmount = payoutAmount - payoutTotalFees;
+      }
 
       const transactionData = {
         user_id: req.user.id,
@@ -899,8 +1065,6 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
           payout_type: "wallet_payout",
           original_payment_intent: refund.payment_intent,
           fees: {
-            stripe_fee: payoutStripeFee,
-            conversion_fee: payoutConversionFee,
             total: payoutTotalFees,
           },
           net_amount: payoutNetAmount,
@@ -986,10 +1150,36 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
     // totalPaidOut is already calculated above
     const allSucceeded = payouts.every((p) => p.refund.status === "succeeded");
 
-    // Calculate fees for the actual payout amount
-    const actualStripeFee = totalPaidOut * stripeFeeRate + stripeFixedFee;
-    const actualConversionFee = totalPaidOut * conversionFeeRate;
-    const actualTotalFees = actualStripeFee + actualConversionFee;
+    // Calculate actual fees for the total payout
+    // Sum up all the fees from individual payouts
+    let actualTotalFees = 0;
+    for (const { refund, amount: payoutAmount } of payouts) {
+      const intentFeeBreakdown = feeBreakdowns.find(
+        (fb) => fb.paymentIntentId === refund.payment_intent
+      );
+
+      if (intentFeeBreakdown) {
+        const feeProportion = payoutAmount / intentFeeBreakdown.amount;
+        actualTotalFees += intentFeeBreakdown.fees.totalFees * feeProportion;
+      } else {
+        // Fallback: recalculate for this payment intent
+        const fees = await calculateStripeFees(
+          refund.payment_intent,
+          payoutAmount,
+          userCurrency
+        );
+        actualTotalFees += fees.totalFees;
+      }
+    }
+
+    // If we still don't have fees calculated, use conservative estimate
+    if (actualTotalFees === 0) {
+      const conservativeFeeRate = 0.029 + 0.008 + 0.02; // 2.9% + 0.8% + 2%
+      const conservativeFixedFee = 0.3;
+      actualTotalFees =
+        totalPaidOut * conservativeFeeRate + conservativeFixedFee;
+    }
+
     const actualNetAmount = totalPaidOut - actualTotalFees;
 
     // Update balance immediately (deduct full amount including fees from available balance and add net payout to total payout)
@@ -1008,8 +1198,6 @@ router.post("/request-payout", authenticateToken, async (req, res) => {
         amount: totalPaidOut,
         netAmount: actualNetAmount,
         fees: {
-          stripeFee: actualStripeFee,
-          conversionFee: actualConversionFee,
           total: actualTotalFees,
         },
         status: allSucceeded ? "succeeded" : "pending",
